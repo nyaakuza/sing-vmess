@@ -11,6 +11,7 @@ import (
 	"io"
 	mRand "math/rand"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common"
@@ -70,12 +71,12 @@ func NewClient(userId string, security string, alterId int, options ...ClientOpt
 }
 
 func (c *Client) DialConn(upstream net.Conn, destination M.Socksaddr) (N.ExtendedConn, error) {
-	conn := &clientConn{c.dialRaw(upstream, CommandTCP, destination)}
+	conn := &clientConn{rawClientConn: c.dialRaw(upstream, CommandTCP, destination)}
 	return conn, conn.writeHandshake(nil)
 }
 
 func (c *Client) DialEarlyConn(upstream net.Conn, destination M.Socksaddr) N.ExtendedConn {
-	return &clientConn{c.dialRaw(upstream, CommandTCP, destination)}
+	return &clientConn{rawClientConn: c.dialRaw(upstream, CommandTCP, destination)}
 }
 
 type PacketConn interface {
@@ -84,16 +85,16 @@ type PacketConn interface {
 }
 
 func (c *Client) DialPacketConn(upstream net.Conn, destination M.Socksaddr) (PacketConn, error) {
-	conn := &clientPacketConn{clientConn{c.dialRaw(upstream, CommandUDP, destination)}, destination}
+	conn := &clientPacketConn{clientConn: clientConn{rawClientConn: c.dialRaw(upstream, CommandUDP, destination)}, destination: destination}
 	return conn, conn.writeHandshake(nil)
 }
 
 func (c *Client) DialEarlyPacketConn(upstream net.Conn, destination M.Socksaddr) PacketConn {
-	return &clientPacketConn{clientConn{c.dialRaw(upstream, CommandUDP, destination)}, destination}
+	return &clientPacketConn{clientConn: clientConn{rawClientConn: c.dialRaw(upstream, CommandUDP, destination)}, destination: destination}
 }
 
 func (c *Client) DialXUDPPacketConn(upstream net.Conn, destination M.Socksaddr) (PacketConn, error) {
-	conn := &clientConn{c.dialRaw(upstream, CommandMux, destination)}
+	conn := &clientConn{rawClientConn: c.dialRaw(upstream, CommandMux, destination)}
 	err := conn.writeHandshake(nil)
 	if err != nil {
 		return nil, err
@@ -102,7 +103,7 @@ func (c *Client) DialXUDPPacketConn(upstream net.Conn, destination M.Socksaddr) 
 }
 
 func (c *Client) DialEarlyXUDPPacketConn(upstream net.Conn, destination M.Socksaddr) PacketConn {
-	return NewXUDPConn(&clientConn{c.dialRaw(upstream, CommandMux, destination)}, destination)
+	return NewXUDPConn(&clientConn{rawClientConn: c.dialRaw(upstream, CommandMux, destination)}, destination)
 }
 
 var (
@@ -437,6 +438,15 @@ func (c *rawClientConn) Upstream() any {
 
 type clientConn struct {
 	rawClientConn
+	// Writers share the cipher, masking and padding state and the first write sends the request header,
+	// so a write from another goroutine (a WireGuard detour sends from one per peer) must wait for it.
+	writeAccess sync.Mutex
+}
+
+func (c *clientConn) NeedHandshakeForWrite() bool {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	return c.writer == nil
 }
 
 func (c *clientConn) Read(p []byte) (n int, err error) {
@@ -450,6 +460,8 @@ func (c *clientConn) Read(p []byte) (n int, err error) {
 }
 
 func (c *clientConn) Write(p []byte) (n int, err error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if c.writer == nil {
 		err = c.writeHandshake(p)
 		if err == nil {
@@ -471,6 +483,8 @@ func (c *clientConn) ReadBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if c.writer == nil {
 		defer buffer.Release()
 		return c.writeHandshake(buffer.Bytes())
@@ -519,6 +533,8 @@ func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 }
 
 func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if c.writer == nil {
 		err = c.writeHandshake(nil)
 		if err != nil {
@@ -548,6 +564,8 @@ func (c *clientPacketConn) RemoteAddr() net.Addr {
 }
 
 func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if c.writer == nil {
 		err := c.writeHandshake(nil)
 		if err != nil {

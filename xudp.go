@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -17,8 +18,10 @@ var _ N.EarlyWriter = (*XUDPConn)(nil)
 
 type XUDPConn struct {
 	net.Conn
-	writer         N.ExtendedWriter
-	destination    M.Socksaddr
+	writer      N.ExtendedWriter
+	destination M.Socksaddr
+	// The first packet opens the session; later packets from other goroutines must follow it.
+	writeAccess    sync.Mutex
 	requestWritten bool
 }
 
@@ -145,20 +148,14 @@ func (c *XUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return bufio.WritePacketBuffer(c, buf.As(p), M.SocksaddrFromNet(addr))
 }
 
+// The new and keep frame headers have the same length, so the headroom does not depend on requestWritten.
 func (c *XUDPConn) frontHeadroom(addrLen int) int {
-	if !c.requestWritten {
-		var headerLen int
-		headerLen += 2 // frame len
-		headerLen += 5 // frame header
-		headerLen += addrLen
-		headerLen += 2 // payload len
-		return headerLen
-	} else {
-		return 7 + addrLen + 2
-	}
+	return 2 + 5 + addrLen + 2 // frame len, frame header, address, payload len
 }
 
 func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	dataLen := buffer.Len()
 	addrLen := M.SocksaddrSerializer.AddrPortLen(destination)
 	if !c.requestWritten {
@@ -201,6 +198,8 @@ func (c *XUDPConn) FrontHeadroom() int {
 }
 
 func (c *XUDPConn) NeedHandshakeForWrite() bool {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	return !c.requestWritten
 }
 
